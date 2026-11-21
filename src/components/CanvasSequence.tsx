@@ -20,14 +20,18 @@ interface CanvasSequenceProps {
   className?: string;
 }
 
+const MAX_CACHED_FRAMES = 300;
+const PRELOAD_RADIUS = 40;
+
 export default function CanvasSequence({
   totalFrames: initialTotalFrames = 960,
-  initialPreloadCount = 40,
+  initialPreloadCount = 280,
   className = "",
 }: CanvasSequenceProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasWrapperRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
 
   const triggerRef = useRef<ScrollTrigger | null>(null);
   const isSeekingRef = useRef<boolean>(false);
@@ -38,8 +42,10 @@ export default function CanvasSequence({
 
   const targetFrameRef = useRef<number>(1);
   const currentFrameRef = useRef<number>(1);
-  const lastDrawnIndexRef = useRef<number>(0);
+  const lastDrawnFrameRef = useRef<number>(0);
   const animationFrameRef = useRef<number | null>(null);
+  const lastScrollDirectionRef = useRef<1 | -1>(1);
+  const lastProgressRef = useRef<number>(0);
 
   const [isBookingOpen, setIsBookingOpen] = useState<boolean>(false);
   const [bookingService, setBookingService] = useState<string | undefined>(undefined);
@@ -49,9 +55,10 @@ export default function CanvasSequence({
   const [preloaderHidden, setPreloaderHidden] = useState<boolean>(false);
   const [totalCached, setTotalCached] = useState<number>(0);
 
-  const imagesRef = useRef<(HTMLImageElement | null)[]>([]);
-  const isLoadingRef = useRef<boolean>(false);
-  const loadQueueRef = useRef<number[]>([]);
+  const imagesRef = useRef<Map<number, HTMLImageElement>>(new Map());
+  const loadQueueRef = useRef<Set<number>>(new Set());
+  const loadingRef = useRef<boolean>(false);
+  const decodeQueueRef = useRef<Set<number>>(new Set());
 
   const handleOpenBooking = (serviceName?: string) => {
     setBookingService(serviceName);
@@ -92,7 +99,7 @@ export default function CanvasSequence({
           return;
         }
 
-        const existing = imagesRef.current[frameIndex - 1];
+        const existing = imagesRef.current.get(frameIndex);
         if (existing && existing.complete && existing.naturalWidth > 0) {
           resolve(existing);
           return;
@@ -103,7 +110,7 @@ export default function CanvasSequence({
         img.src = getFrameUrl(frameIndex, frameExtension);
 
         img.onload = () => {
-          imagesRef.current[frameIndex - 1] = img;
+          imagesRef.current.set(frameIndex, img);
           resolve(img);
         };
 
@@ -113,21 +120,44 @@ export default function CanvasSequence({
             fallbackImg.decoding = "async";
             fallbackImg.src = getFrameUrl(frameIndex, "jpg");
             fallbackImg.onload = () => {
-              imagesRef.current[frameIndex - 1] = fallbackImg;
+              imagesRef.current.set(frameIndex, fallbackImg);
               resolve(fallbackImg);
             };
             fallbackImg.onerror = () => {
-              imagesRef.current[frameIndex - 1] = null;
+              imagesRef.current.set(frameIndex, null as any);
               resolve(null);
             };
           } else {
-            imagesRef.current[frameIndex - 1] = null;
+            imagesRef.current.set(frameIndex, null as any);
             resolve(null);
           }
         };
       });
     },
     [frameExtension, totalFrames]
+  );
+
+  const evictOldFrames = useCallback(
+    (keepAround: number, radius: number = PRELOAD_RADIUS) => {
+      const minKeep = Math.max(1, keepAround - radius * 2);
+      const maxKeep = Math.min(totalFrames, keepAround + radius * 2);
+
+      if (imagesRef.current.size <= MAX_CACHED_FRAMES) return;
+
+      const toDelete: number[] = [];
+      imagesRef.current.forEach((_, index) => {
+        if (index < minKeep || index > maxKeep) {
+          toDelete.push(index);
+        }
+      });
+
+      toDelete.forEach((index) => {
+        imagesRef.current.delete(index);
+      });
+
+      setTotalCached(imagesRef.current.size);
+    },
+    [totalFrames]
   );
 
   const drawFrameToContext = useCallback(
@@ -152,36 +182,63 @@ export default function CanvasSequence({
     []
   );
 
+  const getBestAvailableFrame = useCallback(
+    (targetFrame: number): HTMLImageElement | null => {
+      let img = imagesRef.current.get(targetFrame) ?? null;
+      if (img && img.complete && img.naturalWidth > 0) return img;
+
+      let bestFrame = targetFrame;
+      let bestDistance = Infinity;
+
+      for (let d = 1; d <= PRELOAD_RADIUS; d++) {
+        const lower = targetFrame - d;
+        const upper = targetFrame + d;
+
+        if (lower >= 1) {
+          const candidate = imagesRef.current.get(lower);
+          if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+            const dist = d;
+            if (dist < bestDistance) {
+              bestDistance = dist;
+              bestFrame = lower;
+            }
+          }
+        }
+
+        if (upper <= totalFrames) {
+          const candidate = imagesRef.current.get(upper);
+          if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+            const dist = d;
+            if (dist < bestDistance) {
+              bestDistance = dist;
+              bestFrame = upper;
+            }
+          }
+        }
+
+        if (bestDistance !== Infinity) break;
+      }
+
+      return imagesRef.current.get(bestFrame) ?? null;
+    },
+    [totalFrames]
+  );
+
   const drawFrame = useCallback(
     (frameNumber: number) => {
       const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext("2d", { alpha: false });
-      if (!ctx) return;
+      const ctx = ctxRef.current;
+      if (!canvas || !ctx) return;
 
-      let img = imagesRef.current[frameNumber - 1];
-      if (!img || !img.complete || img.naturalWidth === 0) {
-        for (let i = frameNumber - 2; i >= 0; i--) {
-          const candidate = imagesRef.current[i];
-          if (candidate && candidate.complete && candidate.naturalWidth > 0) {
-            img = candidate;
-            break;
-          }
-        }
-      }
+      const img = getBestAvailableFrame(frameNumber);
       if (!img) {
-        loadSingleFrame(frameNumber).then(() => {
-          const c = canvasRef.current?.getContext("2d", { alpha: false });
-          if (c) {
-            const fallback = imagesRef.current[frameNumber - 1];
-            if (fallback) drawFrameToContext(c, canvasRef.current!, fallback);
-          }
-        });
+        loadSingleFrame(frameNumber);
         return;
       }
+
       drawFrameToContext(ctx, canvas, img);
     },
-    [loadSingleFrame, drawFrameToContext]
+    [getBestAvailableFrame, loadSingleFrame, drawFrameToContext]
   );
 
   const resizeCanvas = useCallback(() => {
@@ -199,6 +256,11 @@ export default function CanvasSequence({
       canvas.height = targetHeight;
     }
 
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (ctx) {
+      ctxRef.current = ctx;
+    }
+
     drawFrame(Math.round(currentFrameRef.current));
   }, [drawFrame]);
 
@@ -208,13 +270,52 @@ export default function CanvasSequence({
     return () => window.removeEventListener("resize", resizeCanvas);
   }, [resizeCanvas]);
 
+  const prioritizeFramesAroundTarget = useCallback(() => {
+    if (loadingRef.current) return;
+    const target = Math.round(targetFrameRef.current);
+    const direction = lastScrollDirectionRef.current;
+
+    const start = Math.max(1, target - PRELOAD_RADIUS);
+    const end = Math.min(totalFrames, target + PRELOAD_RADIUS);
+
+    const missing: number[] = [];
+    for (let i = start; i <= end; i++) {
+      const img = imagesRef.current.get(i);
+      if (!img || !img.complete || img.naturalWidth === 0) {
+        if (!loadQueueRef.current.has(i)) {
+          missing.push(i);
+        }
+      }
+    }
+
+    if (missing.length === 0) return;
+
+    if (direction === 1) {
+      missing.sort((a, b) => a - b);
+    } else {
+      missing.sort((a, b) => b - a);
+    }
+
+    loadingRef.current = true;
+    missing.forEach((frame) => {
+      loadQueueRef.current.add(frame);
+      loadSingleFrame(frame).finally(() => {
+        loadQueueRef.current.delete(frame);
+      });
+    });
+    loadingRef.current = false;
+
+    evictOldFrames(target);
+  }, [totalFrames, loadSingleFrame, evictOldFrames]);
+
   useEffect(() => {
     if (totalFrames <= 0) return;
 
-    imagesRef.current = new Array(totalFrames).fill(null);
+    imagesRef.current.clear();
+    loadQueueRef.current.clear();
 
     let isCancelled = false;
-    const target = Math.min(120, totalFrames);
+    const target = Math.min(initialPreloadCount, totalFrames);
     const BATCH_SIZE = 30;
     let nextIndex = 1;
     let completed = 0;
@@ -224,14 +325,17 @@ export default function CanvasSequence({
         const batchEnd = Math.min(nextIndex + BATCH_SIZE, target + 1);
         const promises: Promise<HTMLImageElement | null>[] = [];
         for (let i = nextIndex; i < batchEnd; i++) {
-          promises.push(loadSingleFrame(i));
+          if (!loadQueueRef.current.has(i)) {
+            loadQueueRef.current.add(i);
+            promises.push(loadSingleFrame(i).finally(() => loadQueueRef.current.delete(i)));
+          }
         }
         await Promise.all(promises);
         nextIndex = batchEnd;
         completed = nextIndex - 1;
         if (!isCancelled) {
           setPreloadedCount(completed);
-          setTotalCached(completed);
+          setTotalCached(imagesRef.current.size);
         }
       }
       if (!isCancelled) {
@@ -249,13 +353,13 @@ export default function CanvasSequence({
     return () => {
       isCancelled = true;
     };
-  }, [totalFrames, loadSingleFrame, drawFrame]);
+  }, [totalFrames, initialPreloadCount, loadSingleFrame, drawFrame]);
 
   useEffect(() => {
-    if (!isPreloadComplete || totalFrames <= 120) return;
+    if (!isPreloadComplete || totalFrames <= initialPreloadCount) return;
 
     let isCancelled = false;
-    let nextIndex = 121;
+    let nextIndex = initialPreloadCount + 1;
     const BATCH_SIZE = 20;
 
     const loadNextBatch = async () => {
@@ -264,13 +368,16 @@ export default function CanvasSequence({
       const batchEnd = Math.min(nextIndex + BATCH_SIZE, totalFrames + 1);
       const promises: Promise<HTMLImageElement | null>[] = [];
       for (let i = nextIndex; i < batchEnd; i++) {
-        promises.push(loadSingleFrame(i));
+        if (!loadQueueRef.current.has(i)) {
+          loadQueueRef.current.add(i);
+          promises.push(loadSingleFrame(i).finally(() => loadQueueRef.current.delete(i)));
+        }
       }
       await Promise.all(promises);
       nextIndex = batchEnd;
 
       if (!isCancelled) {
-        setTotalCached(nextIndex - 1);
+        setTotalCached(imagesRef.current.size);
         if (nextIndex <= totalFrames) {
           setTimeout(loadNextBatch, 50);
         }
@@ -282,28 +389,7 @@ export default function CanvasSequence({
     return () => {
       isCancelled = true;
     };
-  }, [isPreloadComplete, totalFrames, loadSingleFrame]);
-
-  const prioritizeFramesAroundTarget = useCallback(() => {
-    if (isLoadingRef.current) return;
-    const target = Math.round(targetFrameRef.current);
-    const start = Math.max(1, target - 40);
-    const end = Math.min(totalFrames, target + 40);
-
-    const missing: number[] = [];
-    for (let i = start; i <= end; i++) {
-      const img = imagesRef.current[i - 1];
-      if (!img || !img.complete || img.naturalWidth === 0) {
-        missing.push(i);
-      }
-    }
-
-    if (missing.length === 0) return;
-
-    isLoadingRef.current = true;
-    missing.forEach((frame) => loadSingleFrame(frame));
-    isLoadingRef.current = false;
-  }, [totalFrames, loadSingleFrame]);
+  }, [isPreloadComplete, totalFrames, initialPreloadCount, loadSingleFrame]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasWrapperRef.current || totalFrames <= 0) return;
@@ -323,6 +409,11 @@ export default function CanvasSequence({
           Math.max(1, Math.floor(self.progress * (totalFrames - 1)) + 1)
         );
         targetFrameRef.current = targetIndex;
+
+        const direction = self.progress > lastProgressRef.current ? 1 : -1;
+        lastScrollDirectionRef.current = direction;
+        lastProgressRef.current = self.progress;
+
         prioritizeFramesAroundTarget();
       },
     });
@@ -348,15 +439,20 @@ export default function CanvasSequence({
     let running = true;
     const loop = () => {
       if (!running) return;
-      currentFrameRef.current += (targetFrameRef.current - currentFrameRef.current) * 0.25;
+
+      const targetFrame = targetFrameRef.current;
+      currentFrameRef.current += (targetFrame - currentFrameRef.current) * 0.25;
       const frame = Math.max(1, Math.min(totalFrames, Math.round(currentFrameRef.current)));
-      if (frame !== lastDrawnIndexRef.current) {
-        lastDrawnIndexRef.current = frame;
+
+      if (frame !== lastDrawnFrameRef.current) {
+        lastDrawnFrameRef.current = frame;
         drawFrame(frame);
+
         if (frame !== currentFrame) {
           setCurrentFrame(frame);
         }
       }
+
       animationFrameRef.current = requestAnimationFrame(loop);
     };
 
@@ -369,7 +465,7 @@ export default function CanvasSequence({
         animationFrameRef.current = null;
       }
     };
-  }, [preloaderHidden, totalFrames, drawFrame, currentFrame]);
+  }, [preloaderHidden, totalFrames, drawFrame]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
