@@ -1,0 +1,24 @@
+Centralize ALL clinic contact details, WhatsApp numbers, doctor info, and booking API/webhook settings into `src/config/clinicConfig.ts` so the client can update everything from one single file (do NOT touch `/public/frames/` or run `next build`):
+
+1. Upgrade `src/config/clinicConfig.ts` with clear, well-commented sections:
+   - `brand`: Clinic name ("Talha Dental"), tagline, and description.
+   - `contact`:
+     * `whatsappNumber`: (e.g. `"923001234567"` with clear comment: `// Enter WhatsApp number with country code without '+'`)
+     * `whatsappDefaultMessage`: `"Hello Talha Dental, I would like to book a dental consultation."`
+     * `phoneDisplay`: `"+92 300 1234567"`
+     * `email`: `"info@talhadental.com"`
+     * `address`: `"Lahore, Pakistan"`
+     * `workingHours`: `"Mon - Sat: 10:00 AM - 8:00 PM"`
+   - `bookingIntegration`:
+     * `mode`: `"whatsapp" | "webhook" | "both"` (default `"both"` so submitting the booking form can send data to an API webhook AND/OR open a pre-filled WhatsApp booking message!)
+     * `webhookUrl`: `""` (with clear comment: `// Optional: Paste Formspree, Web3Forms, or custom Booking API endpoint URL here`)
+     * `apiKey`: `""` (with clear comment: `// Optional: Paste Web3Forms or CRM API key here`)
+   - `doctor`: Dr. Talha's name, credentials ("BDS, RDS"), and experience ("6 years of clinical experience in dentistry, including house job training at CMH Lahore").
+
+2. Wire All Buttons & Modals to `src/config/clinicConfig.ts`:
+   - Make sure the top navbar "Consultation" button, all 10 service pads' "Get in Touch" & WhatsApp buttons, the Dr. Talha pad's "Book Consultation" button, and the Consultation/Booking modal ALL pull their numbers, links, and submission logic directly from `src/config/clinicConfig.ts` (zero hardcoded numbers anywhere else in `src/`).
+   - In the Booking Modal, if `webhookUrl` is provided in `clinicConfig.ts`, `POST` the form data (`name`, `phone`, `service`, `preferredDate`, `notes`) as JSON to `webhookUrl` (including `access_key: apiKey` if `apiKey` is set), and also offer a direct 1-click "Confirm via WhatsApp" option with all form fields pre-filled.
+
+3. Update `README.md` with a quick 1-minute guide showing where `src/config/clinicConfig.ts` is located and how to paste the WhatsApp number and Booking API/Webhook URL.
+
+4. Verify cleanly with `npx tsc --noEmit`.
