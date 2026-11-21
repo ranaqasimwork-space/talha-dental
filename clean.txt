@@ -1,16 +1,17 @@
-Fix ALL scroll jumping, backward-scroll snapping, and GPU stutter so the canvas scrubs like Apple's AirPods Pro page (do NOT modify files inside `/public/frames/`):
+Fix the severe video frame freeze/hang in `src/components/CanvasSequence.tsx` immediately (do NOT modify `/public/frames/` or run `next build`):
 
-1. Eliminate Lenis + GSAP + Lerp Double-Smoothing Conflict:
-   - Inspect `src/hooks/useLenis.ts`, `src/app/page.tsx`, and `src/components/CanvasSequence.tsx`.
-   - Remove conflicting dual-smoothing: keep Lenis with crisp, responsive settings (`lerp: 0.12`, `smoothWheel: true`, `syncTouch: false`) properly synced to `ScrollTrigger.update` via `gsap.ticker`, and set GSAP `ScrollTrigger` `scrub: 0.35` (instead of fighting separate manual lerp loops that cause forward/backward bounce).
-   - Ensure `CanvasSequence.tsx` reads the exact scrubbed progress smoothly without fighting Lenis velocity when reversing scroll direction rapidly.
+1. Replace Heavy `ImageBitmap` + `requestIdleCallback` with Lightweight Native `HTMLImageElement` Streaming:
+   - Remove `createImageBitmap` and `fetch().blob()` completely—they saturate GPU VRAM with 960 uncompressed textures and freeze the browser!
+   - Use standard `new Image()` (`img.decoding = 'async'`, `img.src = ...`) stored in a simple array `imagesRef.current`.
+   - Load the first **120 frames** (`0001` to `0120`) in fast batches of 30 to dismiss the Tooth Preloader in ~1.5 seconds.
+   - Stream remaining frames (`0121` to `0960`) in gentle sequential batches of **20 frames at a time** (waiting for each batch's `onload`/`onerror` before starting the next batch) so the browser main thread and GPU NEVER choke!
+   - Also prioritize loading a ±40 frame window around `targetFrameRef.current` whenever the user scrolls to a new section.
 
-2. Hardware-Accelerated `ImageBitmap` Pre-Decoding & Smart Memory Window:
-   - Decode frames using `createImageBitmap(blob)` (or `img.decode()` off the main thread) so the GPU draws every frame in <1ms with zero main-thread freeze.
-   - Preload & decode the first 280 frames (`0001` to `0280`) in parallel batches before hiding the Tooth Preloader, and stream frames `0281` to `0960` in non-blocking `requestIdleCallback` / small parallel chunks of 25 so scrolling NEVER hangs while background frames download.
-   - Use `ctx.drawImage` with `imageSmoothingEnabled = true` and `desynchronized: true` on the `<canvas>` 2D context (`canvas.getContext('2d', { alpha: false, desynchronized: true })`) for ultra-low-latency rendering.
+2. Clean, Ultra-Light Canvas Render Loop (Zero Redundant Redraws):
+   - Use `canvas.getContext('2d', { alpha: false })` (remove `desynchronized: true` which causes stalls on some Windows GPUs).
+   - Connect Lenis cleanly to `ScrollTrigger.update` via `gsap.ticker`, and set GSAP `ScrollTrigger` to `scrub: true` updating `targetFrameRef.current`.
+   - In a single `requestAnimationFrame` loop, smoothly interpolate `currentFrameRef.current += (targetFrameRef.current - currentFrameRef.current) * 0.25`.
+   - Only call `ctx.drawImage()` when `Math.round(currentFrameRef.current)` changes from `lastDrawnIndexRef.current` (avoiding 60fps redundant full-HD redraws when idle!).
+   - If the target `HTMLImageElement` isn't loaded yet (`!img.complete || img.naturalWidth === 0`), draw the nearest loaded frame so the canvas never blanks or stutters.
 
-3. Strict Monotonic Nearest-Frame Fallback (Zero Forward/Backward Jump):
-   - If the user scrubs rapidly to a frame index not yet decoded, search strictly **backward** (`targetIndex - 1`, `targetIndex - 2`, ...) for the nearest decoded frame—NEVER search forward—so scrolling never jumps ahead and snaps back!
-
-4. Verify cleanly with `npx tsc --noEmit`.
+3. Verify cleanly with `npx tsc --noEmit`.

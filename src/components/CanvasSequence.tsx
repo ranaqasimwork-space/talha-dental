@@ -32,42 +32,32 @@ export default function CanvasSequence({
   const triggerRef = useRef<ScrollTrigger | null>(null);
   const isSeekingRef = useRef<boolean>(false);
 
-  // Total frames in sequence
   const [totalFrames, setTotalFrames] = useState<number>(initialTotalFrames);
   const [currentFrame, setCurrentFrame] = useState<number>(1);
   const [frameExtension, setFrameExtension] = useState<"webp" | "jpg">("webp");
 
-  // Smooth frame playback: display frame lerps toward scroll-driven target
   const targetFrameRef = useRef<number>(1);
-  const displayFrameRef = useRef<number>(1);
+  const currentFrameRef = useRef<number>(1);
+  const lastDrawnIndexRef = useRef<number>(0);
   const animationFrameRef = useRef<number | null>(null);
-  const lastReportedFrameRef = useRef<number>(1);
 
-  // Booking modal state
   const [isBookingOpen, setIsBookingOpen] = useState<boolean>(false);
   const [bookingService, setBookingService] = useState<string | undefined>(undefined);
+
+  const [preloadedCount, setPreloadedCount] = useState<number>(0);
+  const [isPreloadComplete, setIsPreloadComplete] = useState<boolean>(false);
+  const [preloaderHidden, setPreloaderHidden] = useState<boolean>(false);
+  const [totalCached, setTotalCached] = useState<number>(0);
+
+  const imagesRef = useRef<(HTMLImageElement | null)[]>([]);
+  const isLoadingRef = useRef<boolean>(false);
+  const loadQueueRef = useRef<number[]>([]);
 
   const handleOpenBooking = (serviceName?: string) => {
     setBookingService(serviceName);
     setIsBookingOpen(true);
   };
 
-  // Preloader state
-  const [preloadedCount, setPreloadedCount] = useState<number>(0);
-  const [isPreloadComplete, setIsPreloadComplete] = useState<boolean>(false);
-  const [preloaderHidden, setPreloaderHidden] = useState<boolean>(false);
-
-  // Background caching state
-  const [totalCached, setTotalCached] = useState<number>(0);
-
-  // In-memory image cache: maps 1-based frame number -> HTMLImageElement
-  const imageCache = useRef<Map<number, HTMLImageElement>>(new Map());
-  const lastDrawnImage = useRef<HTMLImageElement | null>(null);
-
-  // Target preload count cannot exceed total frames
-  const targetPreload = totalFrames > 0 ? Math.min(initialPreloadCount, totalFrames) : initialPreloadCount;
-
-  // 1. Detect total frames and preferred extension if needed
   useEffect(() => {
     if (initialTotalFrames > 0) {
       setTotalFrames(initialTotalFrames);
@@ -94,61 +84,54 @@ export default function CanvasSequence({
     };
   }, [initialTotalFrames]);
 
-  // 2. Pre-decode images (img.decode()) during loading to eliminate GPU/main-thread jank
   const loadSingleFrame = useCallback(
-    (frameIndex: number): Promise<HTMLImageElement> => {
-      return new Promise((resolve, reject) => {
-        const existing = imageCache.current.get(frameIndex);
+    (frameIndex: number): Promise<HTMLImageElement | null> => {
+      return new Promise((resolve) => {
+        if (frameIndex < 1 || frameIndex > totalFrames) {
+          resolve(null);
+          return;
+        }
+
+        const existing = imagesRef.current[frameIndex - 1];
         if (existing && existing.complete && existing.naturalWidth > 0) {
           resolve(existing);
           return;
         }
 
         const img = new Image();
+        img.decoding = "async";
         img.src = getFrameUrl(frameIndex, frameExtension);
 
-        img.onload = async () => {
-          try {
-            if ("decode" in img) {
-              await img.decode();
-            }
-          } catch {
-            // decode failure is non-fatal
-          }
-          imageCache.current.set(frameIndex, img);
+        img.onload = () => {
+          imagesRef.current[frameIndex - 1] = img;
           resolve(img);
         };
 
         img.onerror = () => {
           if (frameExtension === "webp") {
             const fallbackImg = new Image();
+            fallbackImg.decoding = "async";
             fallbackImg.src = getFrameUrl(frameIndex, "jpg");
-            fallbackImg.onload = async () => {
-              try {
-                if ("decode" in fallbackImg) await fallbackImg.decode();
-              } catch {}
-              imageCache.current.set(frameIndex, fallbackImg);
+            fallbackImg.onload = () => {
+              imagesRef.current[frameIndex - 1] = fallbackImg;
               resolve(fallbackImg);
             };
             fallbackImg.onerror = () => {
-              reject(new Error(`Failed to load frame ${frameIndex}`));
+              imagesRef.current[frameIndex - 1] = null;
+              resolve(null);
             };
           } else {
-            reject(new Error(`Failed to load frame ${frameIndex}`));
+            imagesRef.current[frameIndex - 1] = null;
+            resolve(null);
           }
         };
       });
     },
-    [frameExtension]
+    [frameExtension, totalFrames]
   );
 
-  // High-performance context drawer with aspect-ratio preservation and high smoothing quality
   const drawFrameToContext = useCallback(
-    (
-      ctx: CanvasRenderingContext2D,
-      canvas: HTMLCanvasElement,
-      img: HTMLImageElement
-    ) => {
+    (ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, img: HTMLImageElement) => {
       const w = canvas.width;
       const h = canvas.height;
       const iw = img.naturalWidth;
@@ -165,45 +148,42 @@ export default function CanvasSequence({
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
       ctx.drawImage(img, cx, cy, nw, nh);
-      lastDrawnImage.current = img;
     },
     []
   );
 
-  // 3. Draw a specific frame to canvas with zero pixel drops
   const drawFrame = useCallback(
     (frameNumber: number) => {
-       const canvas = canvasRef.current;
-       if (!canvas) return;
-       const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
-       if (!ctx) return;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d", { alpha: false });
+      if (!ctx) return;
 
-       let img = imageCache.current.get(frameNumber);
-       if (!img || !img.complete || img.naturalWidth === 0) {
-         // Strict backward nearest-frame fallback (never forward)
-         for (let i = frameNumber - 1; i >= 1; i--) {
-           const candidate = imageCache.current.get(i);
-           if (candidate && candidate.complete && candidate.naturalWidth > 0) {
-             img = candidate;
-             break;
-           }
-         }
-       }
-       if (!img) {
-         loadSingleFrame(frameNumber)
-           .then((loadedImg) => {
-             const c = canvasRef.current?.getContext("2d", { alpha: false, desynchronized: true });
-             if (c) drawFrameToContext(c, canvasRef.current!, loadedImg);
-           })
-           .catch(() => {});
-         return;
-       }
-       drawFrameToContext(ctx, canvas, img);
+      let img = imagesRef.current[frameNumber - 1];
+      if (!img || !img.complete || img.naturalWidth === 0) {
+        for (let i = frameNumber - 2; i >= 0; i--) {
+          const candidate = imagesRef.current[i];
+          if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+            img = candidate;
+            break;
+          }
+        }
+      }
+      if (!img) {
+        loadSingleFrame(frameNumber).then(() => {
+          const c = canvasRef.current?.getContext("2d", { alpha: false });
+          if (c) {
+            const fallback = imagesRef.current[frameNumber - 1];
+            if (fallback) drawFrameToContext(c, canvasRef.current!, fallback);
+          }
+        });
+        return;
+      }
+      drawFrameToContext(ctx, canvas, img);
     },
     [loadSingleFrame, drawFrameToContext]
   );
 
-  // Resize canvas backing store to match display size and device pixel ratio for Full HD sharpness
   const resizeCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -219,46 +199,41 @@ export default function CanvasSequence({
       canvas.height = targetHeight;
     }
 
-    drawFrame(currentFrame);
-  }, [currentFrame, drawFrame]);
+    drawFrame(Math.round(currentFrameRef.current));
+  }, [drawFrame]);
 
-  // Resize event listener
   useEffect(() => {
     resizeCanvas();
     window.addEventListener("resize", resizeCanvas);
     return () => window.removeEventListener("resize", resizeCanvas);
   }, [resizeCanvas]);
 
-  // 4. Preloader: Fetch and pre-decode first 40 frames
   useEffect(() => {
     if (totalFrames <= 0) return;
 
+    imagesRef.current = new Array(totalFrames).fill(null);
+
     let isCancelled = false;
-    const target = Math.min(initialPreloadCount, totalFrames);
-    const CONCURRENCY = 12;
+    const target = Math.min(120, totalFrames);
+    const BATCH_SIZE = 30;
     let nextIndex = 1;
     let completed = 0;
 
-    const runWorker = async () => {
+    const loadBatch = async () => {
       while (nextIndex <= target && !isCancelled) {
-        const frameIndex = nextIndex++;
-        try {
-          await loadSingleFrame(frameIndex);
-        } catch {
-          // Gracefully continue
+        const batchEnd = Math.min(nextIndex + BATCH_SIZE, target + 1);
+        const promises: Promise<HTMLImageElement | null>[] = [];
+        for (let i = nextIndex; i < batchEnd; i++) {
+          promises.push(loadSingleFrame(i));
         }
-
+        await Promise.all(promises);
+        nextIndex = batchEnd;
+        completed = nextIndex - 1;
         if (!isCancelled) {
-          completed++;
           setPreloadedCount(completed);
-          setTotalCached((prev) => Math.max(prev, completed));
+          setTotalCached(completed);
         }
       }
-    };
-
-    const workers = Array.from({ length: CONCURRENCY }, () => runWorker());
-
-    Promise.all(workers).then(() => {
       if (!isCancelled) {
         setIsPreloadComplete(true);
         drawFrame(1);
@@ -267,48 +242,39 @@ export default function CanvasSequence({
           ScrollTrigger.refresh();
         }, 500);
       }
-    });
+    };
+
+    loadBatch();
 
     return () => {
       isCancelled = true;
     };
-  }, [totalFrames, initialPreloadCount, loadSingleFrame, drawFrame]);
+  }, [totalFrames, loadSingleFrame, drawFrame]);
 
-  // 5. Background Caching: Pre-decode remaining frames non-blocking using idle time
   useEffect(() => {
-    if (!isPreloadComplete || totalFrames <= targetPreload) return;
+    if (!isPreloadComplete || totalFrames <= 120) return;
 
     let isCancelled = false;
-    let nextIndex = targetPreload + 1;
-    let cachedTotal = targetPreload;
-     const BATCH_SIZE = 25;
+    let nextIndex = 121;
+    const BATCH_SIZE = 20;
 
-    const loadNextBatch = () => {
+    const loadNextBatch = async () => {
       if (isCancelled || nextIndex > totalFrames) return;
 
-      const batchPromises: Promise<HTMLImageElement>[] = [];
-      const end = Math.min(nextIndex + BATCH_SIZE, totalFrames + 1);
-
-      for (let i = nextIndex; i < end; i++) {
-        batchPromises.push(loadSingleFrame(i));
+      const batchEnd = Math.min(nextIndex + BATCH_SIZE, totalFrames + 1);
+      const promises: Promise<HTMLImageElement | null>[] = [];
+      for (let i = nextIndex; i < batchEnd; i++) {
+        promises.push(loadSingleFrame(i));
       }
+      await Promise.all(promises);
+      nextIndex = batchEnd;
 
-      nextIndex = end;
-
-      Promise.allSettled(batchPromises).then(() => {
-        if (!isCancelled) {
-          cachedTotal = Math.min(nextIndex - 1, totalFrames);
-          setTotalCached(cachedTotal);
-
-          if ("requestIdleCallback" in window) {
-            (window as unknown as { requestIdleCallback: (cb: () => void) => void }).requestIdleCallback(() => {
-              loadNextBatch();
-            });
-          } else {
-            setTimeout(loadNextBatch, 20);
-          }
+      if (!isCancelled) {
+        setTotalCached(nextIndex - 1);
+        if (nextIndex <= totalFrames) {
+          setTimeout(loadNextBatch, 50);
         }
-      });
+      }
     };
 
     loadNextBatch();
@@ -316,35 +282,49 @@ export default function CanvasSequence({
     return () => {
       isCancelled = true;
     };
-  }, [isPreloadComplete, totalFrames, targetPreload, loadSingleFrame]);
+  }, [isPreloadComplete, totalFrames, loadSingleFrame]);
 
-  // 6. Strictly Vertical ScrollTrigger synchronized with Lenis
+  const prioritizeFramesAroundTarget = useCallback(() => {
+    if (isLoadingRef.current) return;
+    const target = Math.round(targetFrameRef.current);
+    const start = Math.max(1, target - 40);
+    const end = Math.min(totalFrames, target + 40);
+
+    const missing: number[] = [];
+    for (let i = start; i <= end; i++) {
+      const img = imagesRef.current[i - 1];
+      if (!img || !img.complete || img.naturalWidth === 0) {
+        missing.push(i);
+      }
+    }
+
+    if (missing.length === 0) return;
+
+    isLoadingRef.current = true;
+    missing.forEach((frame) => loadSingleFrame(frame));
+    isLoadingRef.current = false;
+  }, [totalFrames, loadSingleFrame]);
+
   useEffect(() => {
     if (!containerRef.current || !canvasWrapperRef.current || totalFrames <= 0) return;
 
-    // Pinned vertical ScrollTrigger driven through Lenis smooth scroll
     const trigger = ScrollTrigger.create({
       trigger: containerRef.current,
       start: "top top",
       end: "+=4500",
       pin: canvasWrapperRef.current,
       pinSpacing: true,
-       scrub: 0.35,
-       horizontal: false,
-       onUpdate: (self) => {
-         if (isSeekingRef.current) return;
-         const targetIndex = Math.min(
-           totalFrames,
-           Math.max(1, Math.floor(self.progress * (totalFrames - 1)) + 1)
-         );
-         targetFrameRef.current = targetIndex;
-         displayFrameRef.current = targetIndex;
-         drawFrame(targetIndex);
-         if (targetIndex !== lastReportedFrameRef.current) {
-           lastReportedFrameRef.current = targetIndex;
-           setCurrentFrame(targetIndex);
-         }
-       },
+      scrub: true,
+      horizontal: false,
+      onUpdate: (self) => {
+        if (isSeekingRef.current) return;
+        const targetIndex = Math.min(
+          totalFrames,
+          Math.max(1, Math.floor(self.progress * (totalFrames - 1)) + 1)
+        );
+        targetFrameRef.current = targetIndex;
+        prioritizeFramesAroundTarget();
+      },
     });
 
     triggerRef.current = trigger;
@@ -354,9 +334,8 @@ export default function CanvasSequence({
       trigger.kill();
       ScrollTrigger.refresh();
     };
-  }, [totalFrames, drawFrame]);
+  }, [totalFrames, prioritizeFramesAroundTarget]);
 
-  // Smooth zero-jump frame playback via lerp interpolation toward the scroll target
   useEffect(() => {
     if (!canvasRef.current || !preloaderHidden) {
       if (animationFrameRef.current !== null) {
@@ -369,16 +348,14 @@ export default function CanvasSequence({
     let running = true;
     const loop = () => {
       if (!running) return;
-      displayFrameRef.current +=
-        (targetFrameRef.current - displayFrameRef.current) * 0.18;
-      const frame = Math.max(
-        1,
-        Math.min(totalFrames, Math.round(displayFrameRef.current))
-      );
-      drawFrame(frame);
-      if (frame !== lastReportedFrameRef.current) {
-        lastReportedFrameRef.current = frame;
-        setCurrentFrame(frame);
+      currentFrameRef.current += (targetFrameRef.current - currentFrameRef.current) * 0.25;
+      const frame = Math.max(1, Math.min(totalFrames, Math.round(currentFrameRef.current)));
+      if (frame !== lastDrawnIndexRef.current) {
+        lastDrawnIndexRef.current = frame;
+        drawFrame(frame);
+        if (frame !== currentFrame) {
+          setCurrentFrame(frame);
+        }
       }
       animationFrameRef.current = requestAnimationFrame(loop);
     };
@@ -392,14 +369,29 @@ export default function CanvasSequence({
         animationFrameRef.current = null;
       }
     };
-  }, [preloaderHidden, totalFrames, drawFrame]);
+  }, [preloaderHidden, totalFrames, drawFrame, currentFrame]);
 
-  // Seek handler for manual scrubber interaction utilizing Lenis smooth navigation
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const lenis = getActiveLenis();
+    if (!lenis) return;
+
+    const onLenisScroll = () => {
+      ScrollTrigger.update();
+    };
+    lenis.on("scroll", onLenisScroll);
+
+    return () => {
+      lenis.off("scroll", onLenisScroll);
+    };
+  }, []);
+
   const handleSeek = (newFrame: number, syncScroll = false) => {
     targetFrameRef.current = newFrame;
-    displayFrameRef.current = newFrame;
+    currentFrameRef.current = newFrame;
     drawFrame(newFrame);
     setCurrentFrame(newFrame);
+    prioritizeFramesAroundTarget();
 
     if (syncScroll && totalFrames > 1 && triggerRef.current) {
       isSeekingRef.current = true;
@@ -420,28 +412,20 @@ export default function CanvasSequence({
     }
   };
 
-  // Preloader progress calculation (0 - 100%)
+  const targetPreload = totalFrames > 0 ? Math.min(initialPreloadCount, totalFrames) : initialPreloadCount;
+
   const preloadProgress =
-    targetPreload > 0
-      ? Math.min(100, Math.round((preloadedCount / targetPreload) * 100))
-      : 0;
+    targetPreload > 0 ? Math.min(100, Math.round((preloadedCount / targetPreload) * 100)) : 0;
 
   const backgroundProgress =
-    totalFrames > 0
-      ? Math.min(100, Math.round((totalCached / totalFrames) * 100))
-      : 0;
+    totalFrames > 0 ? Math.min(100, Math.round((totalCached / totalFrames) * 100)) : 0;
 
   return (
     <div
       ref={containerRef}
       className={`relative w-full bg-black overflow-x-hidden select-none ${className}`}
     >
-      {/* Pinned Vertical Viewport Container */}
-      <div
-        ref={canvasWrapperRef}
-        className="relative w-full h-screen overflow-hidden"
-      >
-        {/* HTML5 Canvas Surface */}
+      <div ref={canvasWrapperRef} className="relative w-full h-screen overflow-hidden">
         <canvas
           ref={canvasRef}
           className="absolute inset-0 w-full h-full block cursor-ns-resize object-cover"
@@ -457,28 +441,17 @@ export default function CanvasSequence({
             }
           }}
         />
-
-        {/* Minimal Premium Dental Clinic Header & Navigation */}
         <HeroOverlay
           isVisible={isPreloadComplete}
           onOpenBooking={() => handleOpenBooking()}
           onAbout={() => handleSeek(960, true)}
         />
-
-        {/* 3 Frame-Synchronized Storytelling Glassmorphism Pads */}
-        <StoryPads
-          currentFrame={currentFrame}
-          onOpenBooking={handleOpenBooking}
-        />
-
-        {/* Functional Appointment Booking Modal */}
+        <StoryPads currentFrame={currentFrame} onOpenBooking={handleOpenBooking} />
         <BookingModal
           isOpen={isBookingOpen}
           onClose={() => setIsBookingOpen(false)}
           defaultService={bookingService}
         />
-
-        {/* Preloader Component */}
         <Preloader
           progress={preloadProgress}
           preloadedCount={preloadedCount}
@@ -490,4 +463,3 @@ export default function CanvasSequence({
     </div>
   );
 }
-
