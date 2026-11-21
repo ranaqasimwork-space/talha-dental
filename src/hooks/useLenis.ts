@@ -27,8 +27,9 @@ export function useLenis() {
   useEffect(() => {
     // 1. Initialize Lenis with smooth cinematic easing
     const instance = new Lenis({
-      lerp: 0.08,
+      lerp: 0.12,
       smoothWheel: true,
+      syncTouch: false,
       autoRaf: false, // Managed by GSAP ticker for 60/120fps lock
     });
 

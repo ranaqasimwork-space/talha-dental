@@ -173,23 +173,32 @@ export default function CanvasSequence({
   // 3. Draw a specific frame to canvas with zero pixel drops
   const drawFrame = useCallback(
     (frameNumber: number) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext("2d", { alpha: false });
-      if (!ctx) return;
+       const canvas = canvasRef.current;
+       if (!canvas) return;
+       const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+       if (!ctx) return;
 
-      const img = imageCache.current.get(frameNumber);
-      if (!img || !img.complete || img.naturalWidth === 0) {
-        // Keep last drawn frame intact so there's ZERO flicker
-        loadSingleFrame(frameNumber)
-          .then((loadedImg) => {
-            drawFrameToContext(ctx, canvas, loadedImg);
-          })
-          .catch(() => {});
-        return;
-      }
-
-      drawFrameToContext(ctx, canvas, img);
+       let img = imageCache.current.get(frameNumber);
+       if (!img || !img.complete || img.naturalWidth === 0) {
+         // Strict backward nearest-frame fallback (never forward)
+         for (let i = frameNumber - 1; i >= 1; i--) {
+           const candidate = imageCache.current.get(i);
+           if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+             img = candidate;
+             break;
+           }
+         }
+       }
+       if (!img) {
+         loadSingleFrame(frameNumber)
+           .then((loadedImg) => {
+             const c = canvasRef.current?.getContext("2d", { alpha: false, desynchronized: true });
+             if (c) drawFrameToContext(c, canvasRef.current!, loadedImg);
+           })
+           .catch(() => {});
+         return;
+       }
+       drawFrameToContext(ctx, canvas, img);
     },
     [loadSingleFrame, drawFrameToContext]
   );
@@ -226,7 +235,7 @@ export default function CanvasSequence({
 
     let isCancelled = false;
     const target = Math.min(initialPreloadCount, totalFrames);
-    const CONCURRENCY = 6;
+    const CONCURRENCY = 12;
     let nextIndex = 1;
     let completed = 0;
 
@@ -272,7 +281,7 @@ export default function CanvasSequence({
     let isCancelled = false;
     let nextIndex = targetPreload + 1;
     let cachedTotal = targetPreload;
-    const BATCH_SIZE = 4;
+     const BATCH_SIZE = 25;
 
     const loadNextBatch = () => {
       if (isCancelled || nextIndex > totalFrames) return;
@@ -320,16 +329,22 @@ export default function CanvasSequence({
       end: "+=4500",
       pin: canvasWrapperRef.current,
       pinSpacing: true,
-      scrub: 0.6,
-      horizontal: false,
-      onUpdate: (self) => {
-        if (isSeekingRef.current) return;
-        const targetIndex = Math.min(
-          totalFrames,
-          Math.max(1, Math.floor(self.progress * (totalFrames - 1)) + 1)
-        );
-        targetFrameRef.current = targetIndex;
-      },
+       scrub: 0.35,
+       horizontal: false,
+       onUpdate: (self) => {
+         if (isSeekingRef.current) return;
+         const targetIndex = Math.min(
+           totalFrames,
+           Math.max(1, Math.floor(self.progress * (totalFrames - 1)) + 1)
+         );
+         targetFrameRef.current = targetIndex;
+         displayFrameRef.current = targetIndex;
+         drawFrame(targetIndex);
+         if (targetIndex !== lastReportedFrameRef.current) {
+           lastReportedFrameRef.current = targetIndex;
+           setCurrentFrame(targetIndex);
+         }
+       },
     });
 
     triggerRef.current = trigger;

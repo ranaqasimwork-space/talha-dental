@@ -1,24 +1,16 @@
-Centralize ALL clinic contact details, WhatsApp numbers, doctor info, and booking API/webhook settings into `src/config/clinicConfig.ts` so the client can update everything from one single file (do NOT touch `/public/frames/` or run `next build`):
+Fix ALL scroll jumping, backward-scroll snapping, and GPU stutter so the canvas scrubs like Apple's AirPods Pro page (do NOT modify files inside `/public/frames/`):
 
-1. Upgrade `src/config/clinicConfig.ts` with clear, well-commented sections:
-   - `brand`: Clinic name ("Talha Dental"), tagline, and description.
-   - `contact`:
-     * `whatsappNumber`: (e.g. `"923001234567"` with clear comment: `// Enter WhatsApp number with country code without '+'`)
-     * `whatsappDefaultMessage`: `"Hello Talha Dental, I would like to book a dental consultation."`
-     * `phoneDisplay`: `"+92 300 1234567"`
-     * `email`: `"info@talhadental.com"`
-     * `address`: `"Lahore, Pakistan"`
-     * `workingHours`: `"Mon - Sat: 10:00 AM - 8:00 PM"`
-   - `bookingIntegration`:
-     * `mode`: `"whatsapp" | "webhook" | "both"` (default `"both"` so submitting the booking form can send data to an API webhook AND/OR open a pre-filled WhatsApp booking message!)
-     * `webhookUrl`: `""` (with clear comment: `// Optional: Paste Formspree, Web3Forms, or custom Booking API endpoint URL here`)
-     * `apiKey`: `""` (with clear comment: `// Optional: Paste Web3Forms or CRM API key here`)
-   - `doctor`: Dr. Talha's name, credentials ("BDS, RDS"), and experience ("6 years of clinical experience in dentistry, including house job training at CMH Lahore").
+1. Eliminate Lenis + GSAP + Lerp Double-Smoothing Conflict:
+   - Inspect `src/hooks/useLenis.ts`, `src/app/page.tsx`, and `src/components/CanvasSequence.tsx`.
+   - Remove conflicting dual-smoothing: keep Lenis with crisp, responsive settings (`lerp: 0.12`, `smoothWheel: true`, `syncTouch: false`) properly synced to `ScrollTrigger.update` via `gsap.ticker`, and set GSAP `ScrollTrigger` `scrub: 0.35` (instead of fighting separate manual lerp loops that cause forward/backward bounce).
+   - Ensure `CanvasSequence.tsx` reads the exact scrubbed progress smoothly without fighting Lenis velocity when reversing scroll direction rapidly.
 
-2. Wire All Buttons & Modals to `src/config/clinicConfig.ts`:
-   - Make sure the top navbar "Consultation" button, all 10 service pads' "Get in Touch" & WhatsApp buttons, the Dr. Talha pad's "Book Consultation" button, and the Consultation/Booking modal ALL pull their numbers, links, and submission logic directly from `src/config/clinicConfig.ts` (zero hardcoded numbers anywhere else in `src/`).
-   - In the Booking Modal, if `webhookUrl` is provided in `clinicConfig.ts`, `POST` the form data (`name`, `phone`, `service`, `preferredDate`, `notes`) as JSON to `webhookUrl` (including `access_key: apiKey` if `apiKey` is set), and also offer a direct 1-click "Confirm via WhatsApp" option with all form fields pre-filled.
+2. Hardware-Accelerated `ImageBitmap` Pre-Decoding & Smart Memory Window:
+   - Decode frames using `createImageBitmap(blob)` (or `img.decode()` off the main thread) so the GPU draws every frame in <1ms with zero main-thread freeze.
+   - Preload & decode the first 280 frames (`0001` to `0280`) in parallel batches before hiding the Tooth Preloader, and stream frames `0281` to `0960` in non-blocking `requestIdleCallback` / small parallel chunks of 25 so scrolling NEVER hangs while background frames download.
+   - Use `ctx.drawImage` with `imageSmoothingEnabled = true` and `desynchronized: true` on the `<canvas>` 2D context (`canvas.getContext('2d', { alpha: false, desynchronized: true })`) for ultra-low-latency rendering.
 
-3. Update `README.md` with a quick 1-minute guide showing where `src/config/clinicConfig.ts` is located and how to paste the WhatsApp number and Booking API/Webhook URL.
+3. Strict Monotonic Nearest-Frame Fallback (Zero Forward/Backward Jump):
+   - If the user scrubs rapidly to a frame index not yet decoded, search strictly **backward** (`targetIndex - 1`, `targetIndex - 2`, ...) for the nearest decoded frame—NEVER search forward—so scrolling never jumps ahead and snaps back!
 
 4. Verify cleanly with `npx tsc --noEmit`.
