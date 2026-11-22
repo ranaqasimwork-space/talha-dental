@@ -1,121 +1,63 @@
 
-You are a Senior Creative Frontend Performance Engineer.
+Analyze the current optimized CanvasSequence.tsx.
 
-I inspected my actual CanvasSequence.tsx implementation.
-I have identified several potential performance bottlenecks.
+The previous optimization improved smooth scrolling,
+but a new issue remains:
 
-PROJECT:
-Next.js 16
-GSAP 3.15
-Lenis 1.3
-HTML Canvas image sequence
-960 WebP frames
+PROBLEM:
+When scrolling slowly, the 960-frame animation works better.
+When scrolling very fast, the animation freezes on one frame
+until the required frame becomes available.
 
-MAIN OBJECTIVE:
-Make the existing cinematic background animation extremely
-smooth, responsive and synchronized with scrolling.
+My test laptop has:
+- 4GB RAM
+- 2nd generation Intel CPU
+
+OBJECTIVE:
+Improve fast-scroll responsiveness without sacrificing
+visual quality or causing excessive memory usage.
+
+INVESTIGATE:
+
+1. Check whether the frame-loading queue gets overwhelmed
+   during rapid scrolling.
+2. Check whether outdated queued requests are still being
+   processed after scroll position changes.
+3. Check whether image decoding blocks urgent frame loading.
+4. Check whether LRU eviction removes frames that are
+   immediately needed again.
+5. Check whether the renderer gets stuck waiting for a
+   missing frame.
+6. Check whether loading and rendering are competing
+   for the main thread.
+
+POTENTIAL IMPROVEMENTS:
+
+- Prioritize the latest requested frame.
+- Cancel or deprioritize obsolete loading requests.
+- Prioritize frames around the current scroll position.
+- Keep a small forward and backward frame buffer.
+- Avoid decoding too many images simultaneously.
+- Keep rendering responsive during fast scrolling.
+- Optimize memory usage for low-RAM devices.
+- Avoid displaying stale frames for too long.
 
 IMPORTANT:
-Mouse-wheel scrolling is already working smoothly.
-Do not modify Lenis scrolling behavior.
-Do not redesign the website.
 
-FIX THESE SPECIFIC ISSUES:
+Do not blindly implement every suggestion.
+First identify the actual bottleneck.
 
-1. REQUESTANIMATIONFRAME LOOP
+Preserve all 960 frames and original image quality.
+Do not modify Lenis, scroll speed, website design,
+GSAP animations or section layouts.
 
-Inspect the animation useEffect in CanvasSequence.tsx.
+Do not preload all 960 frames into memory.
 
-The currentFrame state is updated inside the animation
-loop and is also included in the effect dependency array.
+After implementation:
+- Test fast scrolling.
+- Test reverse scrolling.
+- Test slow scrolling.
+- Run npm run build.
+- Run npx tsc --noEmit.
 
-This may cause unnecessary effect cleanup and animation
-loop restarts.
-
-Refactor the loop so it remains stable and does not
-restart on every currentFrame state update.
-
-Use refs for high-frequency animation values.
-Avoid unnecessary React renders.
-
-Keep StoryPads synchronized with the correct frame.
-
-2. CANVAS OPTIMIZATION
-
-Cache the CanvasRenderingContext2D instead of repeatedly
-retrieving it on every frame.
-
-Optimize drawImage operations.
-
-Avoid unnecessary canvas resizing and clearing.
-
-Preserve the existing image crop and object-cover behavior.
-
-3. FRAME LOADING
-
-Currently the first preload is limited to 120 frames,
-while page.tsx requests an initial preload count of 280.
-
-Fix this inconsistency.
-
-Implement intelligent frame loading:
-
-- Prioritize frames around the current scroll position.
-- Prioritize frames in the current scroll direction.
-- Maintain a controlled loading queue.
-- Avoid duplicate requests.
-- Decode frames before they are needed where possible.
-- Avoid loading all 960 frames simultaneously.
-- Prevent background loading from starving urgent frames.
-
-4. FRAME RENDERING
-
-Avoid rendering the same frame repeatedly.
-
-Do not display an old frame for an unnecessarily long
-time when the requested frame is still loading.
-
-Use an efficient requestAnimationFrame rendering pipeline.
-
-Ensure reverse scrolling works equally well.
-
-5. MEMORY MANAGEMENT
-
-Optimize decoded image caching.
-
-Do not create unlimited ImageBitmap objects.
-
-If ImageBitmap is used, implement proper disposal
-and memory management.
-
-6. PERFORMANCE TESTING
-
-Test:
-- Slow scrolling
-- Fast scrolling
-- Reverse scrolling
-- Long scrolling sessions
-- Initial loading
-- Desktop and mobile
-
-Measure actual performance rather than assuming
-the optimization works.
-
-STRICT RULES:
-
-- Preserve all 960 original frames.
-- Preserve the complete visual sequence.
-- Preserve all 10 dental service sections.
-- Preserve GSAP ScrollTrigger.
-- Preserve Lenis.
-- Do not change scroll speed or website layout.
-- Do not replace canvas with video.
-- Do not remove any visual effects.
-- Do not install unnecessary dependencies.
-
-Before editing, explain the root causes.
-Then implement the fixes.
-Run npm run build and npx tsc --noEmit.
-Report all modified files and any remaining issues.
-
-Do not make unrelated changes.
+Report the exact changes and remaining limitations.

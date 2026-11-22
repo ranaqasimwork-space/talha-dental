@@ -9,7 +9,7 @@ export default function Home() {
 
   return (
     <main className="relative w-full overflow-x-hidden bg-black">
-      <CanvasSequence totalFrames={960} initialPreloadCount={280} />
+      <CanvasSequence totalFrames={960} initialPreloadCount={60} />
     </main>
   );
 }

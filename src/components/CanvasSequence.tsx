@@ -20,12 +20,14 @@ interface CanvasSequenceProps {
   className?: string;
 }
 
-const MAX_CACHED_FRAMES = 300;
+const MAX_CACHED_FRAMES = 100;
 const PRELOAD_RADIUS = 40;
+const KEEP_RADIUS = 70;
+const MAX_CONCURRENT_LOADS = 3;
 
 export default function CanvasSequence({
   totalFrames: initialTotalFrames = 960,
-  initialPreloadCount = 280,
+  initialPreloadCount = 60,
   className = "",
 }: CanvasSequenceProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -44,8 +46,6 @@ export default function CanvasSequence({
   const currentFrameRef = useRef<number>(1);
   const lastDrawnFrameRef = useRef<number>(0);
   const animationFrameRef = useRef<number | null>(null);
-  const lastScrollDirectionRef = useRef<1 | -1>(1);
-  const lastProgressRef = useRef<number>(0);
 
   const [isBookingOpen, setIsBookingOpen] = useState<boolean>(false);
   const [bookingService, setBookingService] = useState<string | undefined>(undefined);
@@ -56,9 +56,9 @@ export default function CanvasSequence({
   const [totalCached, setTotalCached] = useState<number>(0);
 
   const imagesRef = useRef<Map<number, HTMLImageElement>>(new Map());
-  const loadQueueRef = useRef<Set<number>>(new Set());
-  const loadingRef = useRef<boolean>(false);
-  const decodeQueueRef = useRef<Set<number>>(new Set());
+  const pendingQueueRef = useRef<Set<number>>(new Set());
+  const inFlightRef = useRef<Map<number, Promise<HTMLImageElement | null>>>(new Map());
+  const schedActiveRef = useRef<number>(0);
 
   const handleOpenBooking = (serviceName?: string) => {
     setBookingService(serviceName);
@@ -93,56 +93,66 @@ export default function CanvasSequence({
 
   const loadSingleFrame = useCallback(
     (frameIndex: number): Promise<HTMLImageElement | null> => {
-      return new Promise((resolve) => {
-        if (frameIndex < 1 || frameIndex > totalFrames) {
-          resolve(null);
-          return;
-        }
+      if (frameIndex < 1 || frameIndex > totalFrames) {
+        return Promise.resolve(null);
+      }
 
-        const existing = imagesRef.current.get(frameIndex);
-        if (existing && existing.complete && existing.naturalWidth > 0) {
-          resolve(existing);
-          return;
-        }
+      const existing = imagesRef.current.get(frameIndex);
+      if (existing && existing.complete && existing.naturalWidth > 0) {
+        return Promise.resolve(existing);
+      }
 
+      const existingInFlight = inFlightRef.current.get(frameIndex);
+      if (existingInFlight) {
+        return existingInFlight;
+      }
+
+      const promise = new Promise<HTMLImageElement | null>((resolve) => {
         const img = new Image();
         img.decoding = "async";
-        img.src = getFrameUrl(frameIndex, frameExtension);
+
+        const settle = (value: HTMLImageElement | null) => {
+          inFlightRef.current.delete(frameIndex);
+          resolve(value);
+        };
 
         img.onload = () => {
           imagesRef.current.set(frameIndex, img);
-          resolve(img);
+          settle(img);
         };
 
         img.onerror = () => {
           if (frameExtension === "webp") {
             const fallbackImg = new Image();
             fallbackImg.decoding = "async";
-            fallbackImg.src = getFrameUrl(frameIndex, "jpg");
             fallbackImg.onload = () => {
               imagesRef.current.set(frameIndex, fallbackImg);
-              resolve(fallbackImg);
+              settle(fallbackImg);
             };
             fallbackImg.onerror = () => {
               imagesRef.current.set(frameIndex, null as any);
-              resolve(null);
+              settle(null);
             };
+            fallbackImg.src = getFrameUrl(frameIndex, "jpg");
           } else {
             imagesRef.current.set(frameIndex, null as any);
-            resolve(null);
+            settle(null);
           }
         };
+
+        img.src = getFrameUrl(frameIndex, frameExtension);
       });
+
+      inFlightRef.current.set(frameIndex, promise);
+      return promise;
     },
     [frameExtension, totalFrames]
   );
 
   const evictOldFrames = useCallback(
-    (keepAround: number, radius: number = PRELOAD_RADIUS) => {
-      const minKeep = Math.max(1, keepAround - radius * 2);
-      const maxKeep = Math.min(totalFrames, keepAround + radius * 2);
-
-      if (imagesRef.current.size <= MAX_CACHED_FRAMES) return;
+    (keepAround: number) => {
+      const minKeep = Math.max(1, keepAround - KEEP_RADIUS);
+      const maxKeep = Math.min(totalFrames, keepAround + KEEP_RADIUS);
 
       const toDelete: number[] = [];
       imagesRef.current.forEach((_, index) => {
@@ -151,9 +161,18 @@ export default function CanvasSequence({
         }
       });
 
-      toDelete.forEach((index) => {
+      for (const index of toDelete) {
         imagesRef.current.delete(index);
-      });
+      }
+
+      if (imagesRef.current.size > MAX_CACHED_FRAMES) {
+        const keys = Array.from(imagesRef.current.keys());
+        keys.sort((a, b) => Math.abs(b - keepAround) - Math.abs(a - keepAround));
+        const removeCount = imagesRef.current.size - MAX_CACHED_FRAMES;
+        for (let i = 0; i < removeCount && i < keys.length; i++) {
+          imagesRef.current.delete(keys[i]);
+        }
+      }
 
       setTotalCached(imagesRef.current.size);
     },
@@ -184,44 +203,25 @@ export default function CanvasSequence({
 
   const getBestAvailableFrame = useCallback(
     (targetFrame: number): HTMLImageElement | null => {
-      let img = imagesRef.current.get(targetFrame) ?? null;
-      if (img && img.complete && img.naturalWidth > 0) return img;
+      const exact = imagesRef.current.get(targetFrame);
+      if (exact && exact.complete && exact.naturalWidth > 0) return exact;
 
-      let bestFrame = targetFrame;
+      let bestImg: HTMLImageElement | null = null;
       let bestDistance = Infinity;
 
-      for (let d = 1; d <= PRELOAD_RADIUS; d++) {
-        const lower = targetFrame - d;
-        const upper = targetFrame + d;
-
-        if (lower >= 1) {
-          const candidate = imagesRef.current.get(lower);
-          if (candidate && candidate.complete && candidate.naturalWidth > 0) {
-            const dist = d;
-            if (dist < bestDistance) {
-              bestDistance = dist;
-              bestFrame = lower;
-            }
+      imagesRef.current.forEach((candidate, index) => {
+        if (candidate && candidate.complete && candidate.naturalWidth > 0) {
+          const dist = Math.abs(index - targetFrame);
+          if (dist < bestDistance) {
+            bestDistance = dist;
+            bestImg = candidate;
           }
         }
+      });
 
-        if (upper <= totalFrames) {
-          const candidate = imagesRef.current.get(upper);
-          if (candidate && candidate.complete && candidate.naturalWidth > 0) {
-            const dist = d;
-            if (dist < bestDistance) {
-              bestDistance = dist;
-              bestFrame = upper;
-            }
-          }
-        }
-
-        if (bestDistance !== Infinity) break;
-      }
-
-      return imagesRef.current.get(bestFrame) ?? null;
+      return bestImg;
     },
-    [totalFrames]
+    []
   );
 
   const drawFrame = useCallback(
@@ -270,65 +270,84 @@ export default function CanvasSequence({
     return () => window.removeEventListener("resize", resizeCanvas);
   }, [resizeCanvas]);
 
+  const pumpQueueRef = useRef<() => void>(() => {});
+
+  const pumpQueue = useCallback(() => {
+    while (
+      schedActiveRef.current < MAX_CONCURRENT_LOADS &&
+      pendingQueueRef.current.size > 0
+    ) {
+      const target = Math.round(targetFrameRef.current);
+
+      let nextFrame = -1;
+      let bestDistance = Infinity;
+      pendingQueueRef.current.forEach((frame) => {
+        const cached = imagesRef.current.get(frame);
+        const isCached = cached && cached.complete && cached.naturalWidth > 0;
+        if (isCached) {
+          pendingQueueRef.current.delete(frame);
+          return;
+        }
+        if (inFlightRef.current.has(frame)) return;
+
+        const dist = Math.abs(frame - target);
+        if (dist < bestDistance) {
+          bestDistance = dist;
+          nextFrame = frame;
+        }
+      });
+
+      if (nextFrame === -1) break;
+
+      pendingQueueRef.current.delete(nextFrame);
+      schedActiveRef.current += 1;
+
+      loadSingleFrame(nextFrame).finally(() => {
+        schedActiveRef.current -= 1;
+        pumpQueueRef.current();
+      });
+    }
+  }, [loadSingleFrame]);
+
+  pumpQueueRef.current = pumpQueue;
+
   const prioritizeFramesAroundTarget = useCallback(() => {
-    if (loadingRef.current) return;
     const target = Math.round(targetFrameRef.current);
-    const direction = lastScrollDirectionRef.current;
 
     const start = Math.max(1, target - PRELOAD_RADIUS);
     const end = Math.min(totalFrames, target + PRELOAD_RADIUS);
 
-    const missing: number[] = [];
     for (let i = start; i <= end; i++) {
       const img = imagesRef.current.get(i);
-      if (!img || !img.complete || img.naturalWidth === 0) {
-        if (!loadQueueRef.current.has(i)) {
-          missing.push(i);
-        }
-      }
+      const isCached = img && img.complete && img.naturalWidth > 0;
+      if (isCached) continue;
+      if (inFlightRef.current.has(i)) continue;
+      pendingQueueRef.current.add(i);
     }
 
-    if (missing.length === 0) return;
-
-    if (direction === 1) {
-      missing.sort((a, b) => a - b);
-    } else {
-      missing.sort((a, b) => b - a);
-    }
-
-    loadingRef.current = true;
-    missing.forEach((frame) => {
-      loadQueueRef.current.add(frame);
-      loadSingleFrame(frame).finally(() => {
-        loadQueueRef.current.delete(frame);
-      });
-    });
-    loadingRef.current = false;
-
+    pumpQueue();
     evictOldFrames(target);
-  }, [totalFrames, loadSingleFrame, evictOldFrames]);
+  }, [totalFrames, pumpQueue, evictOldFrames]);
 
   useEffect(() => {
     if (totalFrames <= 0) return;
 
     imagesRef.current.clear();
-    loadQueueRef.current.clear();
+    pendingQueueRef.current.clear();
+    inFlightRef.current.clear();
+    schedActiveRef.current = 0;
 
     let isCancelled = false;
     const target = Math.min(initialPreloadCount, totalFrames);
-    const BATCH_SIZE = 30;
     let nextIndex = 1;
     let completed = 0;
 
     const loadBatch = async () => {
       while (nextIndex <= target && !isCancelled) {
-        const batchEnd = Math.min(nextIndex + BATCH_SIZE, target + 1);
+        const batchEnd = Math.min(nextIndex + MAX_CONCURRENT_LOADS, target + 1);
         const promises: Promise<HTMLImageElement | null>[] = [];
         for (let i = nextIndex; i < batchEnd; i++) {
-          if (!loadQueueRef.current.has(i)) {
-            loadQueueRef.current.add(i);
-            promises.push(loadSingleFrame(i).finally(() => loadQueueRef.current.delete(i)));
-          }
+          promises.push(loadSingleFrame(i));
         }
         await Promise.all(promises);
         nextIndex = batchEnd;
@@ -357,39 +376,8 @@ export default function CanvasSequence({
 
   useEffect(() => {
     if (!isPreloadComplete || totalFrames <= initialPreloadCount) return;
-
-    let isCancelled = false;
-    let nextIndex = initialPreloadCount + 1;
-    const BATCH_SIZE = 20;
-
-    const loadNextBatch = async () => {
-      if (isCancelled || nextIndex > totalFrames) return;
-
-      const batchEnd = Math.min(nextIndex + BATCH_SIZE, totalFrames + 1);
-      const promises: Promise<HTMLImageElement | null>[] = [];
-      for (let i = nextIndex; i < batchEnd; i++) {
-        if (!loadQueueRef.current.has(i)) {
-          loadQueueRef.current.add(i);
-          promises.push(loadSingleFrame(i).finally(() => loadQueueRef.current.delete(i)));
-        }
-      }
-      await Promise.all(promises);
-      nextIndex = batchEnd;
-
-      if (!isCancelled) {
-        setTotalCached(imagesRef.current.size);
-        if (nextIndex <= totalFrames) {
-          setTimeout(loadNextBatch, 50);
-        }
-      }
-    };
-
-    loadNextBatch();
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [isPreloadComplete, totalFrames, initialPreloadCount, loadSingleFrame]);
+    setTotalCached(imagesRef.current.size);
+  }, [isPreloadComplete, totalFrames, initialPreloadCount]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasWrapperRef.current || totalFrames <= 0) return;
@@ -409,10 +397,6 @@ export default function CanvasSequence({
           Math.max(1, Math.floor(self.progress * (totalFrames - 1)) + 1)
         );
         targetFrameRef.current = targetIndex;
-
-        const direction = self.progress > lastProgressRef.current ? 1 : -1;
-        lastScrollDirectionRef.current = direction;
-        lastProgressRef.current = self.progress;
 
         prioritizeFramesAroundTarget();
       },
